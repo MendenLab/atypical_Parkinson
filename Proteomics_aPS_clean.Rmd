@@ -1,0 +1,1669 @@
+---
+title: "Proteomics aPS project"
+author: "Clara Meijs"
+date: "2023-09-26"
+output:
+  html_document:
+    df_print: paged
+    keep_md: yes
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 5
+    theme: lumen
+---
+
+## Load libraries
+
+Start with clearing environment and loading packages
+
+```{r libraries, results='hide', message=FALSE,class.source = 'fold-hide'}
+rm(list=ls())
+library(ggthemes)
+library(pheatmap)
+library(ggplot2)
+library(matrixStats)
+library(wesanderson)
+library(clusterProfiler)
+library(enrichplot)
+library(msigdbr)
+library(dichromat)
+library(stringr)
+library(dplyr)
+library(ggrepel)
+library(reshape2)
+library(umap)
+library(ggthemes)
+library(cowplot)
+library(DEP)
+library(naniar)
+library(SummarizedExperiment)
+library(data.table)
+library(tidyverse)
+library(readxl)
+library(org.Hs.eg.db)
+
+```
+
+## Set working directories
+
+```{r set-working-directories,message=FALSE,class.source = 'fold-hide'}
+# if you are using Rstudio run the following command, otherwise, set the working directory to the folder where this script is in
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+# create directory for results
+dir.create(file.path(getwd(),'results'), showWarnings = FALSE)
+# create directory for plots
+dir.create(file.path(getwd(),'plots'), showWarnings = FALSE)
+```
+
+## Load Perseus results
+
+```{r load perseus results}
+
+#function to get correct protein name from the IDs
+f = function(x){ 
+        a = unlist(strsplit(x, split='|', fixed=TRUE))[3]
+        a = unlist(strsplit(a, split='_HUMAN', fixed=TRUE))[1]
+        return(a)}
+
+#load Perseus results
+filenames <- list.files("data/perseus_results", pattern="*.txt", full.names=TRUE)
+perseus_results <- lapply(filenames, read.delim)
+names(perseus_results) = gsub("data/perseus_results/DE_FDR0.05_", "", filenames)
+names(perseus_results) = gsub(".txt", "", names(perseus_results))
+protein_names_perseus = perseus_results[[2]]$Protein.IDs[8:length(perseus_results[[2]]$Protein.IDs)]
+perseus_clin = list()
+
+#make a subselection of rows and columns, and change the col names and the protein IDs
+for(i in 1:length(perseus_results)){
+  perseus_results[[i]] = as.data.frame(perseus_results[[i]])
+  perseus_clin[[i]] = perseus_results[[i]][1:7,]
+  perseus_results[[i]] = perseus_results[[i]][8:nrow(perseus_results[[i]]),]
+  cn = colnames(perseus_results[[i]])
+  cn[grep("q.value", cn)] = "FDR"
+  cn[grep("Diff", cn)] = "diff"
+  cn[grep("Protein.IDs", cn)] = "name"
+  colnames(perseus_results[[i]]) = cn
+  perseus_results[[i]]$name = unlist(lapply(perseus_results[[i]]$name, FUN = f))
+  perseus_results[[i]]$name = make.unique(perseus_results[[i]]$name)
+  perseus_results[[i]]$FDR = gsub(",", ".", perseus_results[[i]]$FDR)
+  perseus_results[[i]]$diff = gsub(",", ".", perseus_results[[i]]$diff)
+  perseus_results[[i]]$FDR = as.numeric(perseus_results[[i]]$FDR)
+  perseus_results[[i]]$diff = as.numeric(perseus_results[[i]]$diff)
+}
+
+names(perseus_clin) = names(perseus_results)
+
+#make a better list of Uniprot accession numbers and their gene names
+f = function(x){ 
+        a = unlist(strsplit(x, split='|', fixed=TRUE))[3]
+        a = unlist(strsplit(a, split='_HUMAN', fixed=TRUE))[1]
+        b = unlist(strsplit(x, split='|', fixed=TRUE))[2]
+        return(c(a,b))}
+uniprot_to_genename = matrix(nrow = length(protein_names_perseus), ncol = 3)
+for(i in 1:length(protein_names_perseus)){
+  uniprot_to_genename[i,] = c(protein_names_perseus[i], f(protein_names_perseus[i]))
+}
+colnames(uniprot_to_genename) = c("full_name", "gene_name", "uniprot_accession")
+uniprot_to_genename = as.data.frame(uniprot_to_genename)
+
+#change the gene names to uniprot and then to better gene name again
+genes = select(org.Hs.eg.db, uniprot_to_genename$uniprot_accession, "SYMBOL", "UNIPROT")
+genes = genes %>% distinct(genes$UNIPROT, .keep_all = TRUE)
+uniprot_to_genename$better_gene_name = genes$SYMBOL
+for(i in 1:length(perseus_results)){
+  for(j in 1:nrow(perseus_results[[i]])){
+    name = perseus_results[[i]]$name[j]
+    if(!is.na(uniprot_to_genename[uniprot_to_genename$gene_name == name, "better_gene_name"])){
+      name = uniprot_to_genename[uniprot_to_genename$gene_name == name, "better_gene_name"]
+    }
+    perseus_results[[i]]$name[j] = name
+  }
+}
+
+#separate DEx results and intensity results
+perseus_intensities = list()
+
+for(i in 1:length(perseus_results)){
+  cols = ncol(perseus_results[[i]])
+  intensity_cols = grep("Intensity", colnames(perseus_results[[i]]))
+  
+  perseus_intensities[[i]] = perseus_results[[i]][, intensity_cols]
+  rownames(perseus_intensities[[i]]) = perseus_results[[i]]$name
+  names(perseus_intensities)[i] = names(perseus_results)[i]
+  perseus_results[[i]] = perseus_results[[i]][, (cols-7):cols]
+  
+}
+  
+# The directions how Pia wants them:
+    
+    # PD vs Ctrl
+    # Non-PD-Synu vs Ctrl
+    # Tau vs Ctrl
+    # APS vs Ctrl
+    # Non-PD-Synu vs PD
+    # Non-PD-Synu vs Tau
+    # Tau vs PD
+    # APS vs PD
+    # All (APS + PD) vs Ctrl
+
+#switch the ctrl to contrast place and the ones with wrong direction as well
+perseus_with_control_group = grep("CTR", names(perseus_results))
+for(i in perseus_with_control_group){
+  perseus_results[[i]]$diff = perseus_results[[i]]$diff * -1
+  name = names(perseus_results)[i]
+  name = gsub("CTR_", "", name)
+  name = paste0(name, "_CTR")
+  names(perseus_results)[i] = name
+}
+
+#make other directions also correct, because the following should be switched:
+perseus_wrong_direction = c(6, 7, 8) #("PD_aPD"   "PD_Synu"  "PD_Tau")
+for(i in perseus_wrong_direction){
+  perseus_results[[i]]$diff = perseus_results[[i]]$diff * -1
+  name = names(perseus_results)[i]
+  name = gsub("PD_", "", name)
+  name = paste0(name, "_PD")
+  names(perseus_results)[i] = name
+}
+
+#make an intensity table and a clinical table
+
+    #take single data tables 
+    perseus_intensities_dt = perseus_intensities[[1]]
+    perseus_clin_dt = perseus_clin[[1]]
+    # take one clinical variables table
+    perseus_clin_dt = t(perseus_clin_dt)
+    #add colnames
+    colnames(perseus_clin_dt) = c("Type", "Condition", "Bio.Rep", "Tube_ID", "Sex", "Disease", "Pathy")
+    #adjust first row to not include the colnames
+    perseus_clin_dt[1,] = c("E", "Ctrl", "48", "Ctr G154", "m", "Ctr", "Ctr")
+    #remove the non-intensity rows
+    perseus_clin_dt = perseus_clin_dt[grep("Intensity", rownames(perseus_clin_dt)),]
+    #make dataframe
+    perseus_clin_dt = as.data.frame(perseus_clin_dt)
+
+    #remove patient with no clinical variables
+    #I checked and we also don't have the Intensity.CSF135 in the clinical data that Ana or I received for the analysis
+    perseus_clin_dt = perseus_clin_dt[rownames(perseus_clin_dt)!= "Intensity.CSF135",]
+    #change condition to factor
+    perseus_clin_dt$Pathy = as.factor(perseus_clin_dt$Pathy)
+    #change factor levels
+    levels(perseus_clin_dt$Pathy) = c("Ctrl", "PD", "Syn", "Tau")
+    #change back to character to make my life easier later
+    perseus_clin_dt$Pathy = as.character(perseus_clin_dt$Pathy)
+    
+    #again remove the CSF 135
+    perseus_intensities_dt = perseus_intensities_dt[,colnames(perseus_intensities_dt)!= "Intensity.CSF135"]
+    #put the proteins on the columns
+    perseus_intensities_dt = as.data.frame(t(perseus_intensities_dt))
+    #make same order as clinical variables
+    perseus_intensities_dt = perseus_intensities_dt[rownames(perseus_clin_dt),]
+    
+    #make intensities numeric
+    for(i in 1:ncol(perseus_intensities_dt)){
+      perseus_intensities_dt[,i] = as.numeric(perseus_intensities_dt[,i])
+    }
+
+    
+#load clinical data
+    clin = read.csv("data/clinical_variables.csv")
+    #keep only patients that are included for proteomics
+    clin = clin[clin$Inchluded.Excluded.Proteomics == "Included",]
+    
+#give clin same order as perseus patients
+    
+    clin$patid_prot = gsub("_", ".", clin$patid_prot)
+    rownames(clin) = clin$patid_prot
+    clin = clin[rownames(perseus_clin_dt),]
+    
+    clin$age_cat
+    
+```
+
+##Visualization 1: Heatmap
+
+```{r Visualization 1: heatmap}
+
+set.seed(9)
+#functions for saving the heatmaps as figures
+        
+        save_pheatmap_pdf <- function(x, filename, width=11/2, height=8/2) {
+           stopifnot(!missing(x))
+           stopifnot(!missing(filename))
+           pdf(filename, width=width, height=height)
+           grid::grid.newpage()
+           grid::grid.draw(x$gtable)
+           dev.off()
+        }
+        
+        make_pheatmap <- function(data, cluster_cols = T, main = "Heatmap", clustering_method = "ward.D"){
+          p = pheatmap::pheatmap(data, name = "expression", cutree_cols = 1,
+                  show_colnames = T,
+                  show_rownames = FALSE,
+                  fontsize = 6,
+                  fontsize_col = 3,
+                  annotation_col = annotation,
+                  annotation_colors = annotation_colours,
+                  color = viridis::viridis(100, option="G", direction = -1,),
+                  main = main,
+                  border_color=NA,
+                  cluster_cols = cluster_cols,
+                  clustering_method = clustering_method,
+                  na_col = "grey50")
+          return(p)
+        }
+        
+        #clustering method
+        method = "ward.D" #see hclust() for meaning of each method
+        #title
+        title = "Perseus_data_heatmap"
+      
+        # get annotations and dataframe ready
+        #annotations
+        annotation = data.frame(group = as.factor(perseus_clin_dt$Pathy), 
+                                sex = as.factor(perseus_clin_dt$Sex), 
+                                age = clin$age, 
+                                neurofilaments = clin$neurofilaments)
+        rownames(annotation) = clin$patid_prot
+        annotation_colours <- list(
+          group = c(Ctrl = "darkseagreen3", PD = "darksalmon", Tau = "darkorchid1", Syn = "royalblue1"), 
+          sex = c(f = "lightpink", m ="lightblue3"), 
+          age = c("white", "darkgreen"), 
+          neurofilaments = c("white", "royalblue"))
+
+#create heatmaps with all patients
+        
+        #without grouping, all proteins
+        p = make_pheatmap(data = as.data.frame(t(perseus_intensities_dt)), 
+                          cluster_cols = T, 
+                          main = paste0("Heatmap all proteins\n",title, "\nclustered"), 
+                          clustering_method = method)
+        save_pheatmap_pdf(p, filename = paste0("plots/heatmap_clustered_",title,".pdf"))
+        
+        # without grouping, 100 most variable proteins
+        d = as.data.frame(t(perseus_intensities_dt))
+        d2 = head(order(colVars(as.matrix(d)),decreasing = T),100)
+        p = make_pheatmap(data = d[d2,],
+                          cluster_cols = T,
+                          main = paste0("Heatmap 100 most variable proteins\n",title, "\nclustered"),
+                          clustering_method = method)
+        save_pheatmap_pdf(p, filename = paste0("plots/heatmap_clustered_mostvar_",title,".pdf"))
+          
+        
+
+
+```
+
+## Visualization 2: UMAP plots
+
+```{r Visualization 2: UMAP plots}
+# set seed for reproducible results
+set.seed(9)
+          group = c("darkseagreen3", "darksalmon", "darkorchid1", "royalblue1")
+          sex = c("lightpink", "lightblue3")
+          age_cat = c("darkgreen", "lightgreen")
+          
+UMAP_density_plot = function(data, 
+                             ggtitle = "UMAP with disease status labels", 
+                             legend_name = "Disease status", 
+                             labels = clin$Condition, 
+                             file_location = "plots/UMAP_condition.pdf", 
+                             file_location_labels = "plots/UMAP_condition_labels.pdf",
+                             colour_set = c("seagreen4", "slateblue1", "salmon")){
+      # run umap function
+      umap_out = umap::umap(data)
+      umap_plot = as.data.frame(umap_out$layout)
+      
+      #add condition labels
+      umap_plot$group = labels
+
+      # plot umap
+      p1 = ggplot(umap_plot) + 
+        geom_point(aes(x=V1, y=V2, color = as.factor(group))) +
+        labs(y= "UMAP2", x = "UMAP1", title = ggtitle) +
+        theme_few() +
+        scale_colour_few() +
+        scale_color_manual(name = legend_name, 
+                           labels = levels(as.factor(umap_plot$group)), 
+                           values = colour_set) 
+  
+      xdens <- 
+        axis_canvas(p1, axis = "x") + 
+        geom_density(data = umap_plot, aes(x = V1, fill = group, colour = group), alpha = 0.3) +
+        scale_fill_manual( values = colour_set) + 
+        scale_colour_manual( values = colour_set)
+      ydens <-
+        axis_canvas(p1, axis = "y", coord_flip = TRUE) + 
+        geom_density(data = umap_plot, aes(x = V2, fill = group, colour = group), alpha = 0.3) +
+        coord_flip() +
+        scale_fill_manual(values = colour_set) + 
+        scale_colour_manual( values = colour_set)
+      p1 %>%
+        insert_xaxis_grob(xdens, grid::unit(1, "in"), position = "top") %>%
+        insert_yaxis_grob(ydens, grid::unit(1, "in"), position = "right") %>%
+        ggdraw()
+      
+      p1
+      # save umap
+      ggsave(file_location, width = 11/2, height = 8/2, units = "in")
+      
+      p1 + geom_text(label = rownames(umap_plot), x = umap_plot$V1, y = umap_plot$V2,
+                     hjust = 0, nudge_x = 1, size = 1.5, colour = "grey")
+      
+      # save umap with labels
+      ggsave(file_location_labels, width = 11/2, height = 8/2, units = "in")
+}
+
+
+  d = perseus_intensities_dt
+  labels_disease = as.factor(perseus_clin_dt$Pathy)
+  labels_sex = as.factor(perseus_clin_dt$Sex)
+  labels_age = as.factor(clin$age_cat)
+  title = "perseus_data_"
+          
+#perform plots with function      
+        UMAP_density_plot(data = d, 
+                          ggtitle = paste0("UMAP with disease status labels\n", title), 
+                          legend_name = "Disease status", 
+                          labels = labels_disease, 
+                          file_location = paste0("plots/UMAP_condition_",title,".pdf"),
+                          file_location_labels = paste0("plots/UMAP_condition_labels_",title,".pdf"),
+                          colour_set = group)
+
+        UMAP_density_plot(data = d, 
+                          ggtitle = paste0("UMAP with sex labels\n", title), 
+                          legend_name = "Sex label", 
+                          labels = labels_sex, 
+                          file_location = paste0("plots/UMAP_sex_",title,".pdf"), 
+                          file_location_labels = paste0("plots/UMAP_sex_labels_",title,".pdf"), 
+                          colour_set = sex)
+        
+        UMAP_density_plot(data = d, 
+                          ggtitle = paste0("UMAP with age labels\n", title), 
+                          legend_name = "Age label", 
+                          labels = labels_age, 
+                          file_location = paste0("plots/UMAP_age_",title,".pdf"), 
+                          file_location_labels = paste0("plots/UMAP_age_labels_",title,".pdf"), 
+                          colour_set = age_cat)
+        
+        
+#perform plots with only most variable proteins      
+        d2 = head(order(colVars(as.matrix(d)),decreasing = T),100)
+        
+        UMAP_density_plot(data = d[,d2], 
+                          ggtitle = paste0("UMAP with disease status labels\n", title, "\nwith 100 most variable proteins"), 
+                          legend_name = "Disease status", 
+                          labels = labels_disease, 
+                          file_location = paste0("plots/UMAP_mostvar_condition_",title,".pdf"),
+                          file_location_labels = paste0("plots/UMAP_mostvar_condition_labels_",title,".pdf"),
+                          colour_set = group)
+
+        UMAP_density_plot(data = d[,d2], 
+                          ggtitle = paste0("UMAP with sex labels\n", title, "\nwith 100 most variable proteins"), 
+                          legend_name = "Sex label", 
+                          labels = labels_sex, 
+                          file_location = paste0("plots/UMAP_mostvar_sex_",title,".pdf"), 
+                          file_location_labels = paste0("plots/UMAP_mostvar_sex_labels_",title,".pdf"), 
+                          colour_set = sex)
+        
+        UMAP_density_plot(data = d[,d2], 
+                          ggtitle = paste0("UMAP with age labels\n", title, "\nwith 100 most variable proteins"), 
+                          legend_name = "Age label", 
+                          labels = labels_age, 
+                          file_location = paste0("plots/UMAP_mostvar_age_",title,".pdf"), 
+                          file_location_labels = paste0("plots/UMAP_mostvar_age_labels_",title,".pdf"), 
+                          colour_set = age_cat)
+
+
+
+```
+
+## Visualization 3: Volcano plot with only the important labels
+
+```{r Visualization 3: volcano with only the important labels}
+
+important_labels = c("CP", "C5", "C9", "SERPINA3", "FGB", "FGG", "FGA", "CPB2", "ITIH4", "AZGP1", "LBP")
+
+volcano_plot <- function(data_res, alpha_sig, name_title){
+  logFC = data_res$logFC
+  fdr = data_res$fdr
+  fdr[fdr == 0] = 0.000001
+  df <- data.frame(x = logFC, 
+                   y = -log10(fdr),
+                   name = data_res$name)
+  names(df) <- c("x","y","name")
+  df <- df %>%
+    mutate(omic_type = case_when(x >= 0 & y >= (-log10(alpha_sig)) ~ "up",
+                                 x <= (0) & y >= (-log10(alpha_sig)) ~ "down",
+                                 TRUE ~ "ns")) 
+  cols <- c("up" = "#d4552b", "down" = "#26b3ff", "ns" = "grey") 
+  sizes <- c("up" = 2, "down" = 2, "ns" = 1) 
+  alphas <- c("up" = 0.7, "down" = 0.7, "ns" = 0.5)
+
+  ggplot(data = df, aes(x,y)) + 
+    geom_point(aes(colour = omic_type), 
+               alpha = 0.5, 
+               shape = 16,
+               size = 3) + 
+    geom_hline(yintercept = -log10(alpha_sig),
+               linetype = "dashed") + 
+    geom_vline(xintercept = 0,linetype = "dashed") +
+    geom_point(data = filter(df, y >= (-log10(alpha_sig))),
+               aes(colour = omic_type), 
+               alpha = 0.5, 
+               shape = 16,
+               size = 4) + 
+    #annotate(geom="text", x=-1.9, y= (-log10(alpha_sig)) + 0.15, label="FDR = 10%",size = 5) +
+    geom_text_repel(data = filter(df, name %in% important_labels & y >= (-log10(alpha_sig)) & y > 0),
+                     aes(label = name),
+                     force = 1,
+                    hjust = 1,
+                     nudge_x = - 0.3,
+                    nudge_y = 0.1,
+                    #direction = "x",
+                     max.overlaps = 10,
+                    segment.size = 0.2,
+                     size = 4) +
+    geom_text_repel(data = filter(df, name %in% important_labels & y >= (-log10(alpha_sig)) & y < 0),
+                    aes(label = name),
+                    force = 1,
+                    hjust = 0,
+                    nudge_x = 0.3,
+                    nudge_y = 0.1,
+                    #direction = "y",
+                    max.overlaps = 10,
+                    size = 4) +
+    scale_colour_manual(values = cols) + 
+    scale_fill_manual(values = cols) + 
+    scale_x_continuous(expand = c(0, 0), 
+                       limits = c(-1.5, 1.5)) + 
+    scale_y_continuous(expand = expansion(add = c(0, 0.1)), 
+                       limits = c(0, NA)) +
+    labs(title = name_title,
+         x = "log2(fold change)",
+         y = expression(-log[10] ~ "(adjusted p-value)"),
+         colour = "Differential \nExpression") +
+    theme_classic() + # Select theme with a white background  
+    theme(axis.title.y = element_text(size = 14),
+          axis.title.x = element_text(size = 14),
+          axis.text = element_text(size = 12),
+          plot.title = element_text(size = 15, hjust = 0.5),
+          text = element_text(size = 14)) #+
+    #annotate("text", x = 2, y = 0, label = paste0(sum(df$omic_type=="up"), " more abundant \n", sum(df$omic_type=="down"), " less abundant"))
+}
+
+#make volcano plot from Perseus results
+for(i in 1:length(perseus_results)){
+         title = paste0("Volcano plot proteomics Perseus results\n", names(perseus_results)[i])
+         print(title)
+         path = paste0("plots/volcano_plot_Perseus_important_labels", names(perseus_results)[i])
+         df = perseus_results[[i]][,c("name", "diff", "FDR")]
+         colnames(df) = c("name", "logFC", "fdr")
+         
+         volcano_plot(df, 0.05 , paste0(title, "\nalpha = FDR 0.05"))
+         ggsave(paste0(path, "_FDR0.05.pdf"), 
+                         width = 11/2, height = 8/2, units = "in")
+         volcano_plot(df, 0.1 , paste0(title, "\nalpha = FDR 0.1"))
+         ggsave(paste0(path, "_FDR0.1.pdf"), 
+                         width = 11/2, height = 8/2, units = "in")
+}
+
+```
+
+## Visualization 4: violin plots of significant proteins 
+
+```{r Visualization 4b: violin plots of significant proteins}
+plots = list()
+l = 1
+library(ggpubr)
+
+for(i in 1:length(perseus_results)){
+  p = perseus_results[[i]]$name[perseus_results[[i]]$FDR<0.1]
+  if(length(p) == 0){
+    print(paste0("no significant proteins in ", names(perseus_results)[i]))
+  }else{
+      d = perseus_intensities_dt[,p]
+      d$status = perseus_clin_dt$Pathy
+      d = d %>%
+        pivot_longer(!status, names_to = "protein", values_to = "abundance")
+
+      plots[[l]] = ggviolin(data = d, x="protein", y="abundance", fill = "status") +
+        #geom_boxplot(aes(fill = "status")) +
+        labs(title = names(perseus_results)[i],
+             x = "significant proteins (FDR 0.1 cut-off)",
+             y = "protein abundancy",
+             fill = "disease strata") +
+        theme_few()
+      names(plots)[l] = names(perseus_results)[i]
+      l = l+1
+  }
+}
+
+library(ggpubr)
+plot = ggarrange(plotlist = plots, ncol = 2, nrow = 2)
+ggsave(plot = plot,
+       file = "plots/boxplots_significant_proteins_Perseus.pdf",
+       width = 11*2, 
+       height = 8*2, 
+       units = "in")
+
+plots[[4]]
+ggsave(file = "plots/boxplots_significant_proteins_Perseus_PD_Synu.pdf", width = 11*4, height = 8, units = "in")
+
+```
+
+## GSEA with clusterprofiler package
+
+```{r GSEA with clusterprofiler package}
+library(clusterProfiler)
+library(enrichplot)
+library(ggplot2)
+library(msigdbr)
+library(dichromat)
+library(stringr)
+library(org.Hs.eg.db)
+redblue<-colorRampPalette(c("red","blue"))
+
+#function for performing GSEA with clusterprofiler package and creating the corresponding plots
+clusterprofiler_gsea = function(data, ont, title, alpha = 0.05, breaks = c(0.001,0.01,0.05)){
+                  
+      #perform gsea
+          dg = sort(data, decreasing = TRUE)  #sort proteins on decreasing log-fold change (required for gsea)
+        
+      #create background according to the ontology used for the analysis    
+          if(ont != "KEGG"){
+            bg <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = ont) %>% 
+                dplyr::select(gs_name, gene_symbol)
+              bg <- bg[bg$gene_symbol %in% names(dg), ]
+          }else{
+            bg <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG") %>% 
+                dplyr::select(gs_name, gene_symbol)
+              bg <- bg[bg$gene_symbol %in% names(dg), ]
+          }
+        
+        #the gsea analysis without cut-off   
+        gse = GSEA(geneList=dg, #performing the gsea
+             nPermSimple = 100000, 
+             minGSSize = 3, #minimum gene set size
+             maxGSSize = 800, #maximum gene set size
+             pvalueCutoff = 1, #we don't select for specific p-value yet
+             verbose = TRUE, 
+             TERM2GENE = bg, #background
+             pAdjustMethod = "BH") #benjamini hochberg correction
+        
+        #the gsea analysis with cut-off   
+        gse2 = GSEA(geneList=dg, #performing the gsea
+             nPermSimple = 100000, 
+             minGSSize = 3, #minimum gene set size
+             maxGSSize = 800, #maximum gene set size
+             pvalueCutoff = alpha, 
+             verbose = TRUE, 
+             TERM2GENE = bg, #background
+             pAdjustMethod = "BH") #benjamini hochberg correction
+        
+      #process gsea results  
+        
+          #if we have no results with less than 0.1 FDR, than we take the best 10 results
+          gse_result = gse@result #from the gsea file we only use the results section to work with
+          if (min(gse_result$p.adjust)<=alpha) {        #take only pathways with a FDR of 0.1 or lower
+              gse_result_top = gse_result[gse_result$p.adjust<=alpha,] 
+              } else {
+                if(nrow(gse_result)<10){
+                  gse_result_top = gse_result
+                }else{
+                  gse_result_top = gse_result[1:10,]
+                }
+              }
+          
+          # prettify description text - to lower case and remove ontology term at the start of each pathway name
+          gse_result_top$Description = chartr("_", " ", gse_result_top$Description)
+          gse_result_top$Description = tolower(gse_result_top$Description)
+          if(ont!="KEGG"){
+              gse_result_top$Description = sub('^\\w+\\s', '', gse_result_top$Description)
+            }
+          gse_result_top$Description <- factor(gse_result_top$Description, #sort results on enrichment score
+                                               levels = gse_result_top$Description[order(gse_result_top$enrichmentScore, 
+                                                                                         decreasing = FALSE)])
+      #create labels for barplot
+          gse_result_top$ngenes = gse_result_top$geom_labels =  rep(NA,nrow(gse_result_top)) #make empty vectors for values
+          for(o in 1:nrow(gse_result_top)){
+            gse_result_top$ngenes[o] = length(unlist(strsplit(gse_result_top$core_enrichment[o], split='/', fixed=TRUE))) #full number of genes by counting words separated by /
+            gse_result_top$geom_labels[o] = paste0(gse_result_top$ngenes[o],"/", gse_result_top$setSize[o])} #paste gene number + set size and significance level into label vector
+
+      #plot figure individually
+
+      barplot = ggplot(data=gse_result_top, 
+            aes(x=Description, y=gse_result_top$enrichmentScore, fill = p.adjust)) +
+            geom_bar(stat="identity") +
+            coord_flip() +
+            scale_fill_gradientn(colours= redblue(255), 
+                                 breaks=breaks,
+                                 limits=c(0,alpha)) +
+            theme(panel.grid.major = element_blank(), 
+                  panel.grid.minor = element_blank(), 
+                  #axis.title.x=element_blank(), 
+                  axis.title.y=element_blank(),
+                  panel.background = element_blank(),
+                  text = element_text(size = 13, family="sans"),
+                  axis.line = element_line(colour = "black")) +
+                  labs(
+                  title=title,
+                       y ="Enrichment Score") +
+            geom_text(aes(label = gse_result_top$geom_labels), colour="white", 
+                      position = position_stack(vjust = 0.5)) + 
+            #geom_text(aes(label = gse_result_top$sign), colour="darkgrey", 
+            #                hjust = -0.25) + 
+            guides(fill=guide_colourbar(title="FDR")) +                                # Modify labels of ggplot2 barplot
+            scale_x_discrete(labels = function(x) str_wrap(x, width = 40)) +
+            ylim(-1, 1)
+            
+            
+    #cnetplot
+      if(nrow(gse2@result>1)){
+
+            cnetplot_labels = cnetplot(gse2, 
+                                       node_label = 'all', 
+                                       showCategory = 1500, 
+                                       color.params = list(foldChange = dg))  +
+            ggtitle(paste0("fgsea gene ontology with \n",title))
+            
+            cnetplot_no_labels = cnetplot(gse2, 
+                                          node_label = 'none', 
+                                          showCategory = 1500, 
+                                          color.params = list(foldChange = dg))  +
+            ggtitle(paste0("fgsea gene ontology with ",title))
+            
+            #check cnetplot data save data
+            write.csv(gse2@result,paste0("results/", title,".csv"))
+      }else{
+        cnetplot_labels = cnetplot_no_labels = "no_signficant_results"
+      }
+          return(list(
+            all_results = gse_result,
+            top_results = gse_result_top,
+            barplot = barplot,
+            cnetplot_data = gse2@result,
+            cnetplot_labels = cnetplot_labels,
+            cnetplot_no_labels = cnetplot_no_labels
+            ))
+          }
+
+##### PERFORMING THE GSEA WITH THE FUNCTION ABOVE ON PERSEUS RESULTS
+#create special directory for these plots
+dir.create(file.path(getwd(),'plots/gsea_clusterprofiler'), showWarnings = FALSE)
+
+#the ontologies to test:
+ontologies = c("BP", "CC", "MF", "KEGG")
+ontologies_text = c("Biological Process", "Cellular Component", "Molecular Function", "KEGG")
+prot_gsea = list()
+l = 1
+
+#only perseus results that we should look at:
+perseus_results_subset = perseus_results[c("Synu_PD", "aPD_PD", "Synu_CTR", "PD_CTR")]
+
+for(i in 1:length(perseus_results_subset)){
+  for(j in 1:length(ontologies)){
+          title = paste0("Perseus_GSEA_clusterprofiler_",names(perseus_results_subset)[i], "_", ontologies[j])
+          df = perseus_results_subset[[i]][,c("name", "diff", "FDR")]
+          colnames(df) = c("name", "logFC", "fdr")
+          df = na.omit(df)
+          
+          #perform GSEA as normal with the new dataframe
+          p = df$fdr #p is a list with signed -log10 FDR and ordered on this
+          p = -log10(p)
+          p[df$logFC<0] = -p[df$logFC<0]
+          names(p) = df$name
+          p = p[!p == Inf] #remove infinite values
+          p = p[!p == -Inf]
+          #print(p)
+          prot_gsea[[l]] = clusterprofiler_gsea(data = p, ont = ontologies[j], title, alpha = 0.1, breaks = c(0.001,0.01,0.05, 0.1))
+          names(prot_gsea)[l] = title
+          print(l)
+          l = l+1
+  }}
+
+
+#save results
+saveRDS(prot_gsea, file = "results/Perseus_GSEA_clusterprofiler_proteins_list.rds")
+#save results in excel
+library(writexl)
+gsea_result_tables = list()
+gsea_sig_result_tables = list()
+for(i in 1:length(prot_gsea)){
+  gsea_result_tables[[i]] = prot_gsea[[i]]$all_results
+  gsea_sig_result_tables[[i]] = prot_gsea[[i]]$top_results
+}
+names(gsea_result_tables) = names(prot_gsea)
+names(gsea_sig_result_tables) = names(prot_gsea)
+names(gsea_result_tables) = gsub("Perseus_GSEA_clusterprofiler_", "", names(gsea_result_tables))
+names(gsea_sig_result_tables) = gsub("Perseus_GSEA_clusterprofiler_", "", names(gsea_sig_result_tables))
+
+write_xlsx(gsea_result_tables, path = "results/GSEA_results_all.xlsx")
+write_xlsx(gsea_sig_result_tables, path = "results/GSEA_results_only_significant.xlsx")
+
+```
+
+## Supervised learning functions
+
+```{r Supervised learning functions}
+# Install and load necessary packages if not already installed
+# install.packages("caret")
+# install.packages("pROC")
+# install.packages("ggplot2")
+
+library(caret)
+library(pROC)
+library(ggplot2)
+
+run_bootstrap_lasso <- function(expression_matrix, disease_status, num_bootstrap, num_folds) {
+  results <- list(AUC = numeric(num_bootstrap), lasso_weights = list(), ROC = list(), models = list())
+  
+  for (b in 1:num_bootstrap) {
+    
+    # Create an index for stratified sampling
+    strat_index <- createDataPartition(disease_status, p = 0.8, list = FALSE, times = 1)
+
+    # Split the data into training and testing sets using the stratified index
+    train_data <- expression_matrix[strat_index, ]
+    train_labels <- disease_status[strat_index]
+    
+    test_data <- expression_matrix[-strat_index, ]
+    test_labels <- disease_status[-strat_index]
+    
+    # Train the model on the training set
+    ctrl = trainControl(method="cv",   
+                              number = num_folds,        
+                              summaryFunction=twoClassSummary,   # Use AUC to pick the best model
+                              classProbs=TRUE,savePredictions = TRUE)
+    model <- train(
+      x = train_data, 
+      y = train_labels, 
+      method = "glmnet", 
+      trControl = ctrl,
+      tuneGrid = expand.grid(alpha = 1, lambda = seq(0.001, 0.1, length = 10))
+    )
+    
+    # Predict on the test set
+    predictions <- predict(model, newdata = test_data, type = "prob")[,1]
+    
+    # Convert disease_status to a an ordered factor variable
+    test_labels <- factor(test_labels, ordered = T)
+    
+    
+    results$AUC[b] <- roc(predictor = predictions, response = test_labels)$auc
+    results$ROC[[b]] <- roc(predictor = predictions, response = test_labels)
+    results$lasso_weights[[b]] <- coef(model$finalModel, s = model$bestTune$lambda)
+    results$models[[b]] = model
+  }
+  return(results)
+}
+
+run_bootstrap_svm <- function(expression_matrix, disease_status, num_bootstrap, num_folds) {
+    results <- list(AUC = numeric(num_bootstrap), svm_weights = list(), ROC = list(), models = list())
+
+    for (b in 1:num_bootstrap) {
+
+        # Create an index for stratified sampling
+        strat_index <- createDataPartition(disease_status, p = 0.8, list = FALSE, times = 1)
+
+        # Split the data into training and testing sets using the stratified index
+        train_data <- expression_matrix[strat_index, ]
+        train_labels <- disease_status[strat_index]
+
+        test_data <- expression_matrix[-strat_index, ]
+        test_labels <- disease_status[-strat_index]
+
+        # Train the model on the training set
+        ctrl <- trainControl(method = "cv",
+                            number = num_folds,
+                            summaryFunction = twoClassSummary,
+                            classProbs = TRUE,
+                            savePredictions = TRUE)
+
+        model <- train(
+            x = train_data,
+            y = train_labels,
+            method = "svmLinear",
+            trControl = ctrl
+        )
+
+        # Predict on the test set
+        predictions <- predict(model, newdata = test_data, type = "prob")[, 1]
+
+        # Convert disease_status to an ordered factor variable
+        test_labels <- factor(test_labels, ordered = T)
+        
+        #model weights
+        coef = model$finalModel@coef[[1]]
+        matr = model$finalModel@xmatrix[[1]]
+        weig = as.data.frame(coef %*% matr)
+
+        # Calculate AUC and store the results
+        results$AUC[b] <- roc(predictor = predictions, response = test_labels)$auc
+        results$ROC[[b]] <- roc(predictor = predictions, response = test_labels)
+        results$svm_weights[[b]] <- weig
+        results$models[[b]] = model
+    }
+
+    return(results)
+}
+
+run_bootstrap_rf <- function(expression_matrix, disease_status, num_bootstrap, num_folds) {
+    results <- list(AUC = numeric(num_bootstrap), rf_importance = list(), ROC = list(), models = list())
+
+    for (b in 1:num_bootstrap) {
+
+        # Create an index for stratified sampling
+        strat_index <- createDataPartition(disease_status, p = 0.8, list = FALSE, times = 1)
+
+        # Split the data into training and testing sets using the stratified index
+        train_data <- expression_matrix[strat_index, ]
+        train_labels <- disease_status[strat_index]
+
+        test_data <- expression_matrix[-strat_index, ]
+        test_labels <- disease_status[-strat_index]
+
+        # Train the model on the training set
+        ctrl <- trainControl(method = "cv",
+                            number = num_folds,
+                            summaryFunction = twoClassSummary,
+                            classProbs = TRUE,
+                            savePredictions = TRUE)
+
+        model <- train(
+            x = train_data,
+            y = train_labels,
+            method = "rf",
+            trControl = ctrl
+        )
+
+        # Predict on the test set
+        predictions <- predict(model, newdata = test_data, type = "prob")[, 1]
+
+        # Convert disease_status to an ordered factor variable
+        test_labels <- factor(test_labels, ordered = TRUE)
+
+        # Calculate AUC and store the results
+        results$AUC[b] <- roc(predictor = predictions, response = test_labels)$auc
+        results$ROC[[b]] <- roc(predictor = predictions, response = test_labels)
+        results$rf_importance[[b]] <- model[["finalModel"]][["importance"]]
+        results$models[[b]] <- model
+    }
+
+    return(results)
+}
+
+
+# Function to plot AUC curve
+plot_auc_curve <- function(results, title) {
+        # Calculate mean AUC and confidence interval
+      rocc = data.frame()
+      for(i in 1:length(results$ROC)){
+        roc_run = results$ROC[[i]]
+        rocc = rbind(rocc, data.frame(Sp = roc_run$specificities, Sn = roc_run$sensitivities, n = rep(1:length(roc_run$sensitivities))))
+      }
+      
+      # aggregate the results and create new data frame
+      Sp = aggregate(Sp ~ n, rocc, mean)$Sp
+      Sn = aggregate(Sn ~ n, rocc, mean)$Sn
+      errorSp = aggregate(Sp ~ n, rocc, sd)$Sp
+      errorSn = aggregate(Sn ~ n, rocc, sd)$Sn
+      plotci = data.frame(Sp,Sn,errorSp,errorSn)
+      auc = results$AUC
+      
+        
+      auc_plot = ggplot(plotci, aes(x=(1-Sp),y=Sn)) + 
+           geom_line(aes(color = "aquamarine4"), linewidth = 2) + 
+           theme_few() +
+           ggtitle(paste0(title, "\nmean ROC curve and 95 % CI")) +
+           geom_ribbon(aes(ymin = (Sn - 0.95*errorSn), 
+                           ymax = (Sn + 0.95*errorSn), 
+                           xmin = (1-Sp - 0.95*errorSp), 
+                           xmax = (1-Sp + 0.95*errorSp),
+                           fill = "#B2B2B2"), 
+                       alpha = 0.5) +
+          
+            scale_color_manual(name = NULL, label = "mean", values = c("aquamarine4")) +
+            scale_fill_manual(name = NULL, label = "95 % CI", values = c('#B2B2B2') ) +
+            annotate("text", x = 0.2, y = 0.8, label = paste("mean AUC: ", round(mean(auc),2), "\u00B1 ", round(sd(auc),2)) ) +
+            geom_abline(slope = 1, color="darkgrey", alpha = 0.3)
+        
+        return(auc_plot)
+}
+
+plot_lasso_weights <- function(lasso_weights, title, n){
+
+      all_weights = as.data.frame(results$lasso_weights[[1]][,1])
+      for(i in 2:length(results$lasso_weights)){
+        all_weights = cbind(all_weights, as.data.frame(results$lasso_weights[[i]][,1]))
+      }
+      all_weights = all_weights[-1,]
+      all_weights[all_weights == 0] <- NA
+      
+      times_included = apply(all_weights, function(x) sum(!is.na(x)) , MARGIN = 1)
+      mean_weight = apply(all_weights, function(x) mean(x, na.rm = T) , MARGIN = 1)
+      summary_df = as.data.frame(cbind(times_included, mean_weight))
+      
+      summary_df[summary_df == "NaN"] = NA
+      
+      # Select the top highest counts and order them
+      top_count <- summary_df[order(-summary_df$times_included), ][1:n, ]
+      top_count$names = rownames(top_count)
+      
+      # Select the top 30 values with the largest absolute values and order them
+      top_weights <- summary_df[order(-abs(summary_df$mean_weight)), ][1:n, ]
+      top_weights$names = rownames(top_weights)
+      
+      # Create a horizontal barplot
+      bar_plot_count <- ggplot(top_count, aes(x = reorder(names, times_included), y = times_included)) +
+        geom_bar(stat = "identity", fill = "skyblue") +
+        labs(title = paste0(title, "\nMost included in the models"), x = "Names", y = "Times included in the models") +
+        theme_few() +
+        coord_flip()
+      bar_plot_weights <- ggplot(top_weights, aes(x = reorder(names, mean_weight), y = mean_weight)) +
+        geom_bar(stat = "identity", fill = "pink2") +
+        labs(title = paste0(title, "\nBiggest Weight Data"), x = "Names", y = "Weights in the models") +
+        theme_few() +
+        coord_flip()
+      
+      return(list(bar_plot_weights = bar_plot_weights, bar_plot_count = bar_plot_count))
+}
+
+plot_svm_weights <- function(svm_weights, title, n){
+
+    # Extract SVM weights from the results
+    all_weights <- as.data.frame(t(svm_weights[[1]][1,]))
+    for (i in 2:length(svm_weights)) {
+        all_weights <- cbind(all_weights, as.data.frame(t(svm_weights[[i]][1,])))
+    }
+    #all_weights <- all_weights[-1, ]
+
+    # Remove zero values
+    all_weights[all_weights == 0] <- NA
+
+    # Calculate mean weight 
+    mean_weight <- apply(all_weights, MARGIN = 1, function(x) mean(x, na.rm = TRUE))
+
+    # Select top n weights
+    top_weights <- as.data.frame(mean_weight[order(-abs(mean_weight))][1:n])
+    top_weights$names <- rownames(top_weights)
+    colnames(top_weights) = c("mean_weight", "names")
+    
+    # Create a horizontal barplot of weights
+    barplot <- ggplot(top_weights, aes(x = reorder(names, mean_weight), y = mean_weight)) +
+        geom_bar(stat = "identity", fill = "pink2") +
+        labs(title = paste0(title, "\nTop Weighted Features"), x = "Names", y = "Weights") +
+        theme_few() +
+        coord_flip()
+
+    return(barplot)
+}
+
+plot_rf_weights <- function(rf_weights, title, n){
+
+    # Extract rf weights from the results
+    all_weights <- as.data.frame(rf_weights[[1]])
+    for (i in 2:length(rf_weights)) {
+        all_weights <- cbind(all_weights, as.data.frame(rf_weights[[i]]))
+    }
+
+    # Remove zero values
+    all_weights[all_weights == 0] <- NA
+
+    # Calculate mean weight 
+    mean_weight <- apply(all_weights, MARGIN = 1, function(x) mean(x, na.rm = TRUE))
+
+    # Select top n weights
+    top_weights <- as.data.frame(mean_weight[order(-abs(mean_weight))][1:n])
+    top_weights$names <- rownames(top_weights)
+    colnames(top_weights) = c("mean_importance", "names")
+    
+    # Create a horizontal barplot of weights
+    barplot <- ggplot(top_weights, aes(x = reorder(names, mean_importance), y = mean_importance)) +
+        geom_bar(stat = "identity", fill = "pink2") +
+        labs(title = paste0(title, "\nTop Importance Features"), x = "Names", y = "Importance") +
+        theme_few() +
+        coord_flip()
+
+    return(barplot)
+}
+
+reduce_feature_space <- function(data_matrix, correlation_threshold) {
+  # Calculate the correlation matrix for proteins only
+  correlation_matrix <- cor(data_matrix[, -1, drop = FALSE])
+
+  # Perform hierarchical clustering
+  dist_matrix <- as.dist(1 - abs(correlation_matrix))
+  hclust_result <- hclust(dist_matrix, method = "complete")
+
+  # Cut the dendrogram to obtain clusters
+  clusters <- cutree(hclust_result, h = 1 - correlation_threshold)
+
+  # Identify features to be removed
+  features_to_remove <- character(0)
+  removed_features_cluster_assignments <- list()
+  for (cluster_id in unique(clusters)) {
+    cluster_features <- names(clusters)[clusters == cluster_id]
+    if (length(cluster_features) > 1) {
+      features_to_remove <- c(features_to_remove, cluster_features[-1])
+      removed_features_cluster_assignments[[cluster_id]] <- cluster_features
+    }
+  }
+
+  # Select the reduced columns
+  selected_columns <- colnames(data_matrix)[!colnames(data_matrix) %in% features_to_remove]
+
+  # Extract the reduced matrix
+  reduced_matrix <- data_matrix[, selected_columns]
+
+  # Return the reduced matrix and removed features information
+  return(list(reduced_matrix = reduced_matrix, removed_features_info = features_to_remove, removed_features_cluster_assignments = removed_features_cluster_assignments))
+}
+
+
+```
+
+## Supervised learning modeling
+
+```{r Supervised learning modeling}
+
+#.TO DO
+# change the function that they export more information about the models 
+#   --> export weight matrices
+#   --> export count matrices
+#   --> export number of features in each model
+#   --> export model details
+#   --> export prediction probabilities with patient labels
+# new weight plot where we put NA as 0
+# add title variable to plot functions
+# visualize the correlation clusters and which features are removed from the feature space
+# check if we get same results if we rerun the models
+
+
+library(caret)
+library(pROC)
+library(glmnet)
+library(ggpubr)
+set.seed(9)
+
+#make copy of intensity table and clinical table for the machine learning
+
+
+#prepare data for analysis
+#put the proteins on the columns
+
+# add a status column
+    #take single data tables 
+    perseus_intensities_dt = perseus_intensities[[1]]
+    perseus_clin_dt = perseus_clin[[1]]
+    # take one clinical variables table
+    perseus_clin_dt = t(perseus_clin_dt)
+    #add colnames
+    colnames(perseus_clin_dt) = c("Type", "Condition", "Bio.Rep", "Tube_ID", "Sex", "Disease", "Pathy")
+    #adjust first row to not include the colnames
+    perseus_clin_dt[1,] = c("E", "Ctrl", "48", "Ctr G154", "m", "Ctr", "Ctr")
+    #remove the non-intensity rows
+    perseus_clin_dt = perseus_clin_dt[grep("Intensity", rownames(perseus_clin_dt)),]
+    #make dataframe
+    perseus_clin_dt = as.data.frame(perseus_clin_dt)
+
+    #remove patient with no clinical variables
+    #I checked and we also don't have the Intensity.CSF135 in the clinical data that Ana or I received for the analysis
+    perseus_clin_dt = perseus_clin_dt[rownames(perseus_clin_dt)!= "Intensity.CSF135",]
+    #change condition to factor
+    perseus_clin_dt$Pathy = as.factor(perseus_clin_dt$Pathy)
+    #change factor levels
+    levels(perseus_clin_dt$Pathy) = c("Ctrl", "PD", "Syn", "Tau")
+    #change back to character to make my life easier later
+    perseus_clin_dt$Pathy = as.character(perseus_clin_dt$Pathy)
+    
+    #again remove the CSF 135
+    perseus_intensities_dt = perseus_intensities_dt[,colnames(perseus_intensities_dt)!= "Intensity.CSF135"]
+    #put the proteins on the columns
+    perseus_intensities_dt = as.data.frame(t(perseus_intensities_dt))
+    #make same order as clinical variables
+    perseus_intensities_dt = perseus_intensities_dt[rownames(perseus_clin_dt),]
+    #add status column
+    perseus_intensities_dt$status = perseus_clin_dt$Pathy
+    #rename df
+    df = perseus_intensities_dt
+    
+    for(i in 1:(ncol(df)-1)){
+      df[,i] = as.numeric(df[,i])
+    }
+
+
+#make different datasets for the different comparisons
+#PD vs Ctrl
+df_PD_Ctrl = df[df$status == "PD" | df$status == "Ctrl",]
+#Syn vs Ctrl
+df_Syn_Ctrl = df[df$status == "Syn" | df$status == "Ctrl",]
+#Tau vs Ctrl
+df_Tau_Ctrl = df[df$status == "Tau" | df$status == "Ctrl",]
+#PD vs Syn
+df_PD_Syn = df[df$status == "Syn" | df$status == "PD",]
+#PD vs Tau
+df_PD_Tau = df[df$status == "Tau" | df$status == "PD",]
+#Syn vs Tau
+df_Syn_Tau = df[df$status == "Syn" | df$status == "Tau",]
+#aPD vs PD 
+df_PD_aPD = df[df$status == "Syn" | df$status == "Tau" | df$status == "PD" ,]
+df_PD_aPD$status = as.factor(df_PD_aPD$status)
+levels(df_PD_aPD$status) = c("PD", "aPD", "aPD")
+#aPD vs ctrl
+df_aPD_Ctrl = df[df$status == "Syn" | df$status == "Tau" | df$status == "Ctrl" ,]
+df_aPD_Ctrl$status = as.factor(df_aPD_Ctrl$status)
+levels(df_aPD_Ctrl$status) = c("Ctrl", "aPD", "aPD")
+#all vs ctrl
+df_all_Ctrl = df[df$status == "Syn" | df$status == "Tau" | df$status == "Ctrl" | df$status == "PD",]
+df_all_Ctrl$status = as.factor(df_all_Ctrl$status)
+levels(df_all_Ctrl$status) = c("Ctrl", "All", "All", "All")
+
+df_list = list(PD_Ctrl = df_PD_Ctrl, Syn_Ctrl = df_Syn_Ctrl, Tau_Ctrl = df_Tau_Ctrl, PD_Syn = df_PD_Syn, PD_Tau = df_PD_Tau, Syn_Tau = df_Syn_Tau, PD_aPD = df_PD_aPD, aPD_Ctrl = df_aPD_Ctrl, all_Ctrl = df_all_Ctrl)
+
+#fix the direction problem:
+  for(i in 1:length(df_list)){
+      #make all status variables a factor
+      df_list[[i]]$status = as.factor(df_list[[i]]$status)
+      #check the direction of the factor variable (machine will take the first level as the control)
+      print(paste0("The name of the dataframe is: ", names(df_list)[i]))
+      print("The order of the levels is:")
+      print(levels(df_list[[i]]$status))
+  }
+
+# The directions how Pia wants them:
+    
+    # PD vs Ctrl
+    # Non-PD-Synu vs Ctrl
+    # Tau vs Ctrl
+    # APS vs Ctrl
+    # Non-PD-Synu vs PD
+    # Non-PD-Synu vs Tau
+    # Tau vs PD
+    # APS vs PD
+    # All (APS + PD) vs Ctrl
+
+
+  #change the order if it is the wrong direction
+  #"Syn_Tau"
+  df_list$Syn_Tau$status <- factor(df_list$Syn_Tau$status, levels = rev(levels(df_list$Syn_Tau$status)))
+
+  #change names if the order is right but the name not
+  names(df_list)[names(df_list) == "PD_Syn"] = "Syn_PD"
+  names(df_list)[names(df_list) == "PD_Tau"] = "Tau_PD" 
+  names(df_list)[names(df_list) == "PD_aPD"] = "aPD_PD"
+
+models = list()
+m = 1
+
+for(i in 1:length(df_list)){
+  set.seed(9)
+  d = df_list[[i]]
+  disease_status = d$status
+  expression_matrix = d[ ,!names(d) == 'status']
+  title = names(df_list)[i]
+  print(title)
+
+  # Run bootstrap LASSO
+  
+    if(!file.exists(paste0("results/supervisedlearning_model", title, "_lm.rds"))){
+      suppressMessages({
+        suppressWarnings({
+        results <- run_bootstrap_lasso(expression_matrix, disease_status, num_bootstrap = 500, num_folds = 5)
+        })})}else{
+          results = readRDS(paste0("results/supervisedlearning_model", title, "_lm.rds"))
+        }
+        
+        #save model in the model results
+        models[[m]] = results[1:3]
+        names(models)[m] = paste0(title, "_lasso")
+        m = m+1
+        
+        saveRDS(results, file = paste0("results/supervisedlearning_model_", title, "_lm.rds"))
+         
+        # Plot AUC curve
+        plot_auc_curve(results = results, title = paste0(title, "\nLasso Regression"))
+        ggsave(filename = paste0("plots/supervisedlearning_new_aucplot_", title, "_lm.pdf"), 
+               width = 11/2, height = 8/2, units = "in")
+        
+        # Plot lasso weights bar plot
+        plots <- plot_lasso_weights(results$lasso_weights, 
+                                    title = paste0(title, "\n lasso regression"), 
+                                    n = 30)
+        ggarrange(plotlist = plots) 
+        ggsave(filename = paste0("plots/supervisedlearning_new_weights_plot_", title, "_lm.pdf"), 
+               width = 11, height = 8, units = "in")
+
+        
+        
+    #Run SUPPORT VECTOR MACHINE
+    if(!file.exists(paste0("results/supervisedlearning_model", title, "_svm.rds"))){
+          # Run bootstrap lasso regression
+        suppressMessages({
+        suppressWarnings({
+        results <- run_bootstrap_svm(expression_matrix, disease_status, num_bootstrap = 500, num_folds = 5)
+        })})}else{
+          results = readRDS(paste0("results/supervisedlearning_model", title, "_svm.rds"))
+        }
+        
+        #save model in the model results
+        models[[m]] = results[1:3]
+        names(models)[m] = paste0(title, "_svm_lin")
+        m = m+1
+        saveRDS(results, file = paste0("results/supervisedlearning_model_", title, "_svm.rds"))
+         
+        # Plot AUC curve
+        plot_auc_curve(results = results, title = paste0(title, "\nSupport Vector Machine (linaer kernel)"))
+        ggsave(filename = paste0("plots/supervisedlearning_new_aucplot_", title, "_svm.pdf"), 
+               width = 11/2, height = 8/2, units = "in")
+        
+        # Plot lasso weights bar plot
+        plot_svm_weights(results$svm_weights, 
+                                    title = paste0(title, "\nSupport Vector Machine (linear kernel)"), 
+                                    n = 30)
+        ggsave(filename = paste0("plots/supervisedlearning_new_weights_plot_", title, "_svm.pdf"), 
+               width = 11/2, height = 8, units = "in")
+  
+        # Run bootstrap RANDOM FOREST
+  
+    if(!file.exists(paste0("results/supervisedlearning_model_", title, "_rf.rds"))){
+      suppressMessages({
+        suppressWarnings({
+        results <- run_bootstrap_rf(expression_matrix, disease_status, num_bootstrap = 500, num_folds = 5)
+        })})}else{
+          results = readRDS(paste0("results/supervisedlearning_model_", title, "_rf.rds"))
+        }
+        
+        #save model in the model results
+        models[[m]] = results[1:3]
+        names(models)[m] = paste0(title, "_rf")
+        m = m+1
+        
+        saveRDS(results, file = paste0("results/supervisedlearning_model", title, "_rf.rds"))
+         
+        # Plot AUC curve
+        plot_auc_curve(results = results, title = paste0(title, "\nRandom Forest"))
+        ggsave(filename = paste0("plots/supervisedlearning_new_aucplot_", title, "_rf.pdf"), 
+               width = 11/2, height = 8/2, units = "in")
+        
+        # Plot lasso weights bar plot
+        plot_rf_weights(results$rf_importance, 
+                                    title = paste0(title, "\nRandom Forest"), 
+                                    n = 30)
+        ggsave(filename = paste0("plots/supervisedlearning_new_weights_plot_", title, "_rf.pdf"), 
+               width = 11/2, height = 8, units = "in")
+    
+}
+
+# with reduced feature space
+
+cor = c(0.4, 0.6, 0.8)
+
+for(j in 1:length(cor)){
+    for(i in 1:length(df_list)){ #correlation threshold 0.6
+      set.seed(9)
+      d = df_list[[i]]
+      disease_status = d$status
+      expression_matrix = d[ ,!names(d) == 'status']
+      title = paste0(names(df_list)[i],"_perseus")
+      print(title)
+      
+      #reduce feature space
+      result <- reduce_feature_space(expression_matrix, correlation_threshold = cor[j])
+    
+      # Access the reduced matrix
+      expression_matrix <- result$reduced_matrix
+      
+      
+      #LASSO 
+        if(!file.exists(paste0("results/supervisedlearning_reduced_", cor[j], "_", title, "_lm.rds"))){
+            # Run bootstrap lasso regression
+            suppressMessages({ suppressWarnings({
+            results <- run_bootstrap_lasso(expression_matrix, disease_status, num_bootstrap = 500, num_folds = 5)
+            })})}else{
+              results = readRDS(paste0("results/supervisedlearning_reduced_", cor[j], "_", title, "_lm.rds"))
+            }
+            
+              #save model in the model results
+            models[[m]] = results[1:3]
+            names(models)[m] = paste0(title, "_reduced_", cor[j], "_lasso")
+            m = m+1
+            saveRDS(results, file = paste0("results/supervisedlearning_reduced_", cor[j], "_", title, "_lm.rds"))
+            
+            # Plot AUC curve
+            plot_auc_curve(results = results, title = paste0(title, "\nlasso regression \nreduced feature space (hclust) (", cor[j], ")"))
+            ggsave(filename = paste0("plots/supervisedlearning_reduced_", cor[j], "_aucplot_", title, "_lm.pdf"), 
+                   width = 11/2, height = 8/2, units = "in")
+            
+            # Plot lasso weights bar plot
+            plots <- plot_lasso_weights(results$lasso_weights, 
+                                        title = paste0(title, "\n lasso regression \nreduced feature space (hclust)(", cor[j], ")"), 
+                                        n = 30)
+            ggarrange(plotlist = plots) 
+            ggsave(filename = paste0("plots/supervisedlearning_reduced_", cor[j], "_weights_plot_", title, "_lm.pdf"), 
+                   width = 11, height = 8, units = "in")
+    }
+}
+
+#reduced feature space but now taking only 100 most variable proteins:
+
+for(i in 1:length(df_list)){
+  set.seed(9)
+  d = df_list[[i]]
+  disease_status = d$status
+  expression_matrix = d[ ,!names(d) == 'status']
+
+  title = paste0(names(df_list)[i], "_100var_perseus")
+  print(title)
+  
+  #reduce the features to 100 most variable
+  col_std_dev <- apply(expression_matrix, 2, sd)
+  top_100_indices <- order(col_std_dev, decreasing = TRUE)[1:100]
+  expression_matrix <- expression_matrix[, top_100_indices, drop = FALSE]
+  
+ # Run bootstrap LASSO
+  
+    if(!file.exists(paste0("results/supervisedlearning_model", title, "_lm.rds"))){
+      suppressMessages({
+        suppressWarnings({
+        results <- run_bootstrap_lasso(expression_matrix, disease_status, num_bootstrap = 500, num_folds = 5)
+        })})}else{
+          results = readRDS(paste0("results/supervisedlearning_model", title, "_lm.rds"))
+        }
+        
+        #save model in the model results
+        models[[m]] = results[1:3]
+        names(models)[m] = paste0(title, "_lasso")
+        m = m+1
+        
+        saveRDS(results, file = paste0("results/supervisedlearning_model_", title, "_lm.rds"))
+         
+        # Plot AUC curve
+        plot_auc_curve(results = results, title = paste0(title, "\nLasso Regression"))
+        ggsave(filename = paste0("plots/supervisedlearning_new_aucplot_", title, "_lm.pdf"), 
+               width = 11/2, height = 8/2, units = "in")
+        
+        # Plot lasso weights bar plot
+        plots <- plot_lasso_weights(results$lasso_weights, 
+                                    title = paste0(title, "\n lasso regression"), 
+                                    n = 30)
+        ggarrange(plotlist = plots) 
+        ggsave(filename = paste0("plots/supervisedlearning_new_weights_plot_", title, "_lm.pdf"), 
+               width = 11, height = 8, units = "in")
+
+        
+        
+    #Run SUPPORT VECTOR MACHINE
+    if(!file.exists(paste0("results/supervisedlearning_model", title, "_svm.rds"))){
+          # Run bootstrap lasso regression
+        suppressMessages({
+        suppressWarnings({
+        results <- run_bootstrap_svm(expression_matrix, disease_status, num_bootstrap = 500, num_folds = 5)
+        })})}else{
+          results = readRDS(paste0("results/supervisedlearning_model", title, "_svm.rds"))
+        }
+        
+        #save model in the model results
+        models[[m]] = results[1:3]
+        names(models)[m] = paste0(title, "_svm_lin")
+        m = m+1
+        saveRDS(results, file = paste0("results/supervisedlearning_model_", title, "_svm.rds"))
+         
+        # Plot AUC curve
+        plot_auc_curve(results = results, title = paste0(title, "\nSupport Vector Machine (linaer kernel)"))
+        ggsave(filename = paste0("plots/supervisedlearning_new_aucplot_", title, "_svm.pdf"), 
+               width = 11/2, height = 8/2, units = "in")
+        
+        # Plot lasso weights bar plot
+        plot_svm_weights(results$svm_weights, 
+                                    title = paste0(title, "\nSupport Vector Machine (linear kernel)"), 
+                                    n = 30)
+        ggsave(filename = paste0("plots/supervisedlearning_new_weights_plot_", title, "_svm.pdf"), 
+               width = 11/2, height = 8, units = "in")
+  
+        # Run bootstrap RANDOM FOREST
+  
+    if(!file.exists(paste0("results/supervisedlearning_model_", title, "_rf.rds"))){
+      suppressMessages({
+        suppressWarnings({
+        results <- run_bootstrap_rf(expression_matrix, disease_status, num_bootstrap = 500, num_folds = 5)
+        })})}else{
+          results = readRDS(paste0("results/supervisedlearning_model_", title, "_rf.rds"))
+        }
+        
+        #save model in the model results
+        models[[m]] = results[1:3]
+        names(models)[m] = paste0(title, "_rf")
+        m = m+1
+        
+        saveRDS(results, file = paste0("results/supervisedlearning_model", title, "_rf.rds"))
+         
+        # Plot AUC curve
+        plot_auc_curve(results = results, title = paste0(title, "\nRandom Forest"))
+        ggsave(filename = paste0("plots/supervisedlearning_new_aucplot_", title, "_rf.pdf"), 
+               width = 11/2, height = 8/2, units = "in")
+        
+        # Plot lasso weights bar plot
+        plot_rf_weights(results$rf_importance, 
+                                    title = paste0(title, "\nRandom Forest"), 
+                                    n = 30)
+        ggsave(filename = paste0("plots/supervisedlearning_new_weights_plot_", title, "_rf.pdf"), 
+               width = 11/2, height = 8, units = "in")
+        
+}
+
+
+saveRDS(models, file = "results/all_supervised_learning_models_perseus.rds")
+
+```
+
+## Plot AUC performances
+
+```{r plot AUC performances}
+library(RColorBrewer)
+library(ggpubr)
+
+names(models) = gsub("_perseus", "", names(models))
+#models = readRDS(file = "results/all_supervised_learning_models.rds")
+
+auc_matrix = as.data.frame(matrix(ncol = 4))
+colnames(auc_matrix) = c("mean", "sd", "comparison", "model")
+
+f = function(name, reduced, mostvar){
+  a = str_split(name, "_")[[1]]
+  comparison = paste0(a[1], "_vs_", a[2])
+  if(reduced){
+    algorithm = paste0("lasso_", a[4])
+  }else if(mostvar){
+     algorithm = paste0(a[4], "_mostvar")
+  }else{
+    algorithm = a[3]
+  }
+  return(list(comparison = comparison, algorithm = algorithm))
+}
+
+for(i in 1:length(models)){
+  name = names(models)[i]
+  reduced = grepl("reduced", name)
+  mostvar = grepl("100var", name)
+  
+  auc_matrix[i,"mean"] = mean(models[[i]]$AUC)
+  auc_matrix[i,"sd"] = sd(models[[i]]$AUC)
+  auc_matrix[i,"comparison"] = f(name, reduced, mostvar)$comparison
+  auc_matrix[i,"model"] = f(name, reduced, mostvar)$algorithm
+  
+}
+
+auc_matrix$comparison = as.factor(auc_matrix$comparison)
+auc_matrix$model = factor(auc_matrix$model, levels = c("lasso",
+                                                       "lasso_0.8", 
+                                                       "lasso_0.6", 
+                                                       "lasso_0.4",
+                                                       "lasso_mostvar",
+                                                       "svm",
+                                                       "svm_mostvar",
+                                                       "rf",
+                                                       "rf_mostvar"))
+
+colours = c("cadetblue4",
+             "cadetblue", 
+              "cadetblue3", 
+              "cadetblue2",
+              "cadetblue1",
+              "darksalmon",
+              "lightpink",
+              "slateblue4",
+              "slateblue1"
+              )
+
+# Create a barplot with error bars
+ggplot(auc_matrix, aes(x = comparison, y = mean, fill = model)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = mean - sd, ymax = mean + sd), position = position_dodge(width = 0.8), width = 0.25) +
+  labs(title = "Barplot with Error Bars for Model Performances (AUC)",
+       x = "Models",
+       y = "Mean AUC with Standard Deviation",
+       fill = "Models") +
+  scale_fill_manual("Models", values = colours) +
+  theme_few() 
+
+ggsave("plots/model_performances.pdf", width = 11*1.5, height = 8/2, units = "in")
+
+```
+
+## Scatterplot of weights in SVM vs differential expression FDR
+
+```{r scatterplot of weights in svm vs differential expression FDR}
+svm_models = models[grep("svm", names(models))]
+
+mean_weights = function(svm_weights){
+  # Extract SVM weights from the results
+    all_weights <- as.data.frame(t(svm_weights[[1]][1,]))
+    for (i in 2:length(svm_weights)) {
+        all_weights <- cbind(all_weights, as.data.frame(t(svm_weights[[i]][1,])))
+    }
+
+    # Remove zero values
+    all_weights[all_weights == 0] <- NA
+
+    # Calculate mean weight 
+    mean_weight <- apply(all_weights, MARGIN = 1, function(x) mean(x, na.rm = TRUE))
+    return(mean_weight)
+}
+
+mean_svm_weights = list()
+for(i in 1:length(svm_models)){
+  mean_svm_weights[[i]] = mean_weights(svm_weights = svm_models[[i]]$svm_weights)
+  names(mean_svm_weights)[i] = names(svm_models)[i]
+}
+
+#match names
+names(mean_svm_weights) = gsub("_svm_lin", "", names(mean_svm_weights))
+names(mean_svm_weights) = gsub("Ctrl", "CTR", names(mean_svm_weights))
+names(mean_svm_weights) = gsub("Syn", "Synu", names(mean_svm_weights))
+
+plots = list()
+
+for(i in 1:length(mean_svm_weights)){
+  name = names(mean_svm_weights)[i]
+  svm = mean_svm_weights[[name]]
+  perseus = perseus_results[[gsub("_100var", "", name)]]
+  overlap = perseus$name[perseus$name %in% names(svm)]
+  svm = svm[overlap]
+  perseus = perseus[perseus$name %in% overlap,]
+  df = as.data.frame(cbind(overlap, svm, perseus$FDR))
+  colnames(df) = c("name", "svm_weight", "FDR")
+  df$svm_weight = as.numeric(df$svm_weight)
+  df$FDR = as.numeric(df$FDR)
+  df$FDR[df$FDR == 0] = 0.001
+  df$minlogFDR = -log10(df$FDR)
+  df$minlogFDR[perseus$diff < 0] = -df$minlogFDR[perseus$diff < 0]
+  
+  # Find the range of values for x and y axes
+  x_range <- range(df$svm_weight)
+  y_range <- range(df$minlogFDR, na.rm = T)
+  
+  # Add some padding to the range
+  x_padding <- 0.05 * diff(x_range)
+  y_padding <- 0.05 * diff(y_range)
+  
+  # Adjust the limits of the x and y axes with padding
+  x_limits <- c(x_range[1] - x_padding, x_range[2] + x_padding)
+  y_limits <- c(y_range[1] - y_padding, y_range[2] + y_padding)
+
+  # Create a scatterplot
+  plots[[i]] = ggplot(df, aes(x = svm_weight, y = minlogFDR)) +
+    geom_point(color = "darksalmon", alpha = 0.5) +
+    # Use geom_text_repel from the 'ggrepel' package for better label placement
+    geom_text_repel(aes(label = ifelse(rank(-abs(svm_weight)) <= 20 | rank(-abs(minlogFDR)) <= 20, name, '')), box.padding = 0.5) +
+    # Set limits for x and y axes with padding
+    scale_x_continuous(limits = x_limits) +
+    scale_y_continuous(limits = y_limits) +
+    # Add horizontal lines
+    geom_hline(yintercept = log10(0.05), linetype = "dashed", color = "red", linewidth = 0.5, na.rm = T) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red", linewidth = 0.5, na.rm = T) +
+    # Customize the plot as needed
+    labs(title = paste0("Scatterplot Comparing Perseus and SVM results for ", name),
+         x = "SVM Results (in feature weight)",
+         y = "Perseus results (in -log10(FDR))") +
+    theme_few() 
+  
+  names(plots)[i] = name
+}
+
+plots_arranged = ggarrange(plotlist = plots, ncol = 3, nrow = 6)
+ggsave(plot = plots_arranged, 
+       file = "plots/scatterplot_svm_versus_perseus.pdf", 
+       width = 11*2, 
+       height = 8*4, 
+        units = "in")
+
+library(writexl)
+mean_svm_weights_df = mean_svm_weights
+for(i in 1:length(mean_svm_weights_df)){
+  mean_svm_weights_df[[i]] = as.data.frame(mean_svm_weights_df[[i]])
+}
+write_xlsx(mean_svm_weights_df, path = "results/mean_svm_weights.xlsx")
+
+```
+
+## Expression matrix sizes reduced vs non_reduced
+
+```{r look up the expression matrix sizes of reduced vs non_reduced}
+
+df_sizes = as.data.frame(matrix(ncol = length(df_list), nrow = length(cor)+1))
+colnames(df_sizes) = names(df_list)
+rownames(df_sizes) = c("original", "0.8", "0.6", "0.4")
+
+for(i in 1:length(df_list)){ 
+  title = names(df_list)[i]
+  df_sizes["original", title] = ncol(df_list[[i]])
+  for(j in 1:length(cor)){
+      set.seed(9)
+      d = df_list[[i]]
+      expression_matrix = d[ ,!names(d) == 'status']
+      
+      #reduce feature space
+      result <- reduce_feature_space(expression_matrix, correlation_threshold = cor[j])
+    
+      # Access the reduced matrix
+      expression_matrix <- result$reduced_matrix
+      
+      df_sizes[as.character(cor[j]), title] = ncol(expression_matrix)
+      
+  }}
+
+df_sizes
+
+```
+
+## Sessioninfo
+
+```{r SessionInfo}
+
+sessionInfo()
+
+```
+
